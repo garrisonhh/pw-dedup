@@ -68,9 +68,9 @@ fn addPassword(
     }
 }
 
-fn extrude(prog: *Progress.Node, path: []const u8) !void {
+fn extrude(path: []const u8) !void {
+    var prog = std.Progress{};
     var prog_node = prog.start("extruding", password_count);
-    prog_node.activate();
     defer prog_node.end();
 
     // buffered write to output
@@ -142,6 +142,8 @@ const MappedFile = struct {
                 fd,
                 offset,
             );
+            
+            std.debug.print("loaded block: {} -> ", .{offset});
 
             // trim to line boundary if there's another block after this one
             var text: []const u8 = memory[text_offset..];
@@ -165,8 +167,8 @@ const MappedFile = struct {
                 // we're done
                 offset = byte_length;
             }
-            
-            std.debug.print("loaded block: {} -> {}\n", .{offset - memory.len, memory.len});
+
+            std.debug.print("{}\n", .{offset});
 
             try blocks.append(ally, Block{
                 .memory = memory,
@@ -284,10 +286,6 @@ pub fn main() !void {
     defer arena.deinit();
     const arena_ally = arena.allocator();
 
-    var prog = std.Progress{};
-    const prog_root = prog.start("password deduplication", 0);
-    defer prog_root.end();
-
     // get input file path from args
     const args = try std.process.argsAlloc(ally);
     defer std.process.argsFree(ally, args);
@@ -312,15 +310,21 @@ pub fn main() !void {
     const in_filepaths = args[2..];
 
     // file management
+    var dedup_prog = std.Progress{};
+    const dedup_node = dedup_prog.start("deduplicating files", in_filepaths.len);
+    defer dedup_node.end();
+
     defer unloadFiles(ally);
+
     for (in_filepaths) |in_filepath| {
         try loadFile(ally, in_filepath);
     }
 
     // do the stuff
     for (files.items, 0..) |file, i| {
-        try dedupFile(arena_ally, prog_root, in_filepaths[i], file);
+        try dedupFile(arena_ally, dedup_node, in_filepaths[i], file);
     }
 
-    try extrude(prog_root, out_filepath);
+    // write to the output file
+    try extrude(out_filepath);
 }
