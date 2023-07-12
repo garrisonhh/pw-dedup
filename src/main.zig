@@ -6,16 +6,15 @@ const Progress = std.Progress;
 
 // map mechanism ===============================================================
 
-const hash_seed = 0xBEEF_FA7; // lol
-const chain_count = 512 * 1024;
-
 const Hash = struct {
     const Self = @This();
+
+    const seed = 0xBEEF_FA7; // lol
 
     n: u64,
 
     fn init(str: []const u8) Self {
-        const n = std.hash.Wyhash.hash(hash_seed, str);
+        const n = std.hash.Wyhash.hash(seed, str);
         return .{ .n = n };
     }
 
@@ -24,74 +23,89 @@ const Hash = struct {
     }
 };
 
-const Node = struct {
-    const Self = @This();
-
-    next: ?*Node,
+const Password = struct {
     hash: Hash,
-    password: []const u8,
+    str: []const u8,
 };
 
-var password_count: usize = 0;
-var chains: [chain_count]?*Node = .{null} ** chain_count;
+const PasswordSet = struct {
+    const Self = @This();
+    const start_size = 1024 * 1024;
 
-fn addPassword(
+    const Chain = struct {
+        mutex: std.Thread.Mutex = .{},
+        list: std.ArrayListUnmanaged(Password) = .{},
+    };
+
     ally: Allocator,
-    password: []const u8,
-) !void {
-    // password validity check
-    if (password.len == 0) return;
+    chains: []Chain,
+    count: usize = 0,
 
-    // find or create a node
-    const hash = Hash.init(password);
-    const index = hash.n % chain_count;
-
-    var trav = chains[index];
-    while (trav) |cnode| : (trav = cnode.next) {
-        if (cnode.hash.eql(hash) and
-            std.mem.eql(u8, cnode.password, password))
-        {
-            // node found
-            break;
-        }
-    } else {
-        // must create node
-        const cnode = try ally.create(Node);
-        cnode.* = .{
-            .next = chains[index],
-            .hash = hash,
-            .password = password, // password string owned by os
+    fn init(ally: Allocator) Allocator.Error!Self {
+        var self = Self{
+            .ally = ally,
+            .chains = try ally.alloc(Chain, start_size),
         };
 
-        chains[index] = cnode;
-        password_count += 1;
+        @memset(self.chains, .{});
+
+        return self;
     }
-}
 
-fn extrude(path: []const u8) !void {
-    var prog = std.Progress{};
-    var prog_node = prog.start("extruding", password_count);
-    defer prog_node.end();
+    fn deinit(self: *Self) void {
+        for (self.chains) |*chain| {
+            chain.list.deinit(self.ally);
+        }
+        self.ally.free(self.chains);
+    }
 
-    // buffered write to output
-    const out_file = try std.fs.cwd().createFile(path, .{});
-    defer out_file.close();
+    fn add(self: *Self, str: []const u8) Allocator.Error!void {
+        const hash = Hash.init(str);
+        const chain = &self.chains[hash.n % self.chains.len];
 
-    var buf_writer = std.io.bufferedWriter(out_file.writer());
-    const strm = buf_writer.writer();
+        // find or append
+        chain.mutex.lock();
+        defer chain.mutex.unlock();
 
-    // iterate over counter and write
-    for (chains) |list| {
-        var trav = list;
-        while (trav) |node| : (trav = node.next) {
-            try strm.print("{s}\n", .{ node.password });
+        for (chain.list.items) |pw| {
+            if (pw.hash.eql(hash) and std.mem.eql(u8, pw.str, str)) {
+                // found match!
+                break;
+            }
+        } else {
+            // no match, add a link
+            self.count += 1;
 
-            prog_node.completeOne();
+            try chain.list.append(self.ally, Password{
+                .hash = hash,
+                .str = str,
+            });
         }
     }
 
-    try buf_writer.flush();
-}
+    fn extrude(self: Self, path: []const u8) !void {
+        var prog = std.Progress{};
+        var prog_node = prog.start("extruding", self.count);
+        defer prog_node.end();
+
+        // buffered write to output
+        const out_file = try std.fs.cwd().createFile(path, .{});
+        defer out_file.close();
+
+        var buf_writer = std.io.bufferedWriter(out_file.writer());
+        const strm = buf_writer.writer();
+
+        // iterate over counter and write
+        for (self.chains) |chain| {
+            for (chain.list.items) |pw| {
+                try strm.print("{s}\n", .{ pw.str });
+                prog_node.completeOne();
+            }
+        }
+
+        try buf_writer.flush();
+    }
+};
 
 // file management =============================================================
 
@@ -237,7 +251,7 @@ fn unloadFiles(ally: Allocator) void {
 }
 
 fn dedupFile(
-    bump_ally: Allocator, // bump allocator for chains
+    set: *PasswordSet,
     prog: *Progress.Node,
     file_display_name: []const u8,
     file: MappedFile,
@@ -260,12 +274,12 @@ fn dedupFile(
     var prog_node = prog.start(desc, est_passwords);
     prog_node.activate();
     defer prog_node.end();
-    
+
     // do work
     {
         var iter = file.iterator();
         while (iter.next()) |password| {
-            try addPassword(bump_ally, password);
+            try set.add(password);
             prog_node.completeOne();
         }
     }
@@ -281,6 +295,9 @@ pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(ally);
     defer arena.deinit();
     const arena_ally = arena.allocator();
+    
+    var set = try PasswordSet.init(arena_ally);
+    defer set.deinit();
 
     // get input file path from args
     const args = try std.process.argsAlloc(ally);
@@ -318,9 +335,9 @@ pub fn main() !void {
 
     // do the stuff
     for (files.items, 0..) |file, i| {
-        try dedupFile(arena_ally, dedup_node, in_filepaths[i], file);
+        try dedupFile(&set, dedup_node, in_filepaths[i], file);
     }
 
     // write to the output file
-    try extrude(out_filepath);
+    try set.extrude(out_filepath);
 }
