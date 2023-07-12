@@ -235,55 +235,93 @@ const MappedFile = struct {
     };
 };
 
-var files: std.ArrayListUnmanaged(MappedFile) = .{};
+/// it fucks those files lmao
+const FileFucker = struct {
+    const Self = @This();
 
-fn loadFile(
-    ally: Allocator,
-    path: []const u8,
-)(Allocator.Error || MappedFile.InitError)!void {
-    const file = try MappedFile.init(ally, path);
-    try files.append(ally, file);
-}
+    files: std.ArrayListUnmanaged(MappedFile) = .{},
 
-fn unloadFiles(ally: Allocator) void {
-    for (files.items) |*file| file.deinit(ally);
-    files.deinit(ally);
-}
-
-fn dedupFile(
-    set: *PasswordSet,
-    prog: *Progress.Node,
-    file_display_name: []const u8,
-    file: MappedFile,
-) !void {
-    // progress
-    var est_passwords: usize = 0;
-
-    {
-        var iter = file.iterator();
-        while (iter.next()) |_| est_passwords += 1;
+    fn deinit(self: *Self, ally: Allocator) void {
+        for (self.files.items) |*file| file.deinit(ally);
+        self.files.deinit(ally);
     }
-    
-    var buf: [512]u8 = undefined;
-    const desc = try std.fmt.bufPrint(
-        &buf,
-        "processing {s}",
-        .{file_display_name},
-    );
 
-    var prog_node = prog.start(desc, est_passwords);
-    prog_node.activate();
-    defer prog_node.end();
+    /// queue a file to be deduped
+    fn add(self: *Self, ally: Allocator, path: []const u8) !void {
+        const file = try MappedFile.init(ally, path);
+        try self.files.append(ally, file);
+    }
 
-    // do work
-    {
-        var iter = file.iterator();
-        while (iter.next()) |password| {
-            try set.add(password);
-            prog_node.completeOne();
+    fn dedupBlock(set: *PasswordSet, block: MappedFile.Block) !void {
+        var passwords = std.mem.tokenizeScalar(u8, block.text, '\n');
+        while (passwords.next()) |str| {
+            if (str.len == 0) continue;
+            try set.add(str);
         }
     }
-}
+
+    fn dedupEntry(set: *PasswordSet, b: *Blockerator) !void {
+        while (b.next()) |block| {
+            try dedupBlock(set, block);
+        }
+        
+        try std.Thread.yield();
+    }
+
+    /// threaded dedup with all the files
+    fn dedup(self: *const Self, set: *PasswordSet) !void {
+        var b = self.blockerator();
+
+        const cpu_count = try std.Thread.getCpuCount();    
+        var threads = std.BoundedArray(std.Thread, 256){};
+
+        for (0..cpu_count) |_| {
+            const thread = try std.Thread.spawn(.{}, dedupEntry, .{set, &b});
+            try threads.append(thread);
+        }
+
+        for (threads.slice()) |thread| {
+            thread.join();
+        }
+    }
+
+    fn blockerator(self: *const Self) Blockerator {
+        return .{ .files = self.files.items };
+    }
+
+    /// thread-safe block queue
+    const Blockerator = struct {
+        files: []const MappedFile,
+        mutex: std.Thread.Mutex = .{},
+        file: usize = 0,
+        block: usize = 0,
+        done: bool = false,
+
+        fn next(b: *Blockerator) ?MappedFile.Block {
+            b.mutex.lock();
+            defer b.mutex.unlock();
+
+            if (b.done) return null;
+            
+            // get block
+            const blocks = b.files[b.file].blocks.items;
+            const block = blocks[b.block];
+
+            // iterate
+            b.block += 1;
+            if (b.block >= blocks.len) {
+                b.file += 1;
+                b.block = 0;
+
+                if (b.file >= b.files.len) {
+                    b.done = true;
+                }
+            }
+
+            return block;
+        }
+    };
+};
 
 // progress ====================================================================
 
@@ -295,9 +333,12 @@ pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(ally);
     defer arena.deinit();
     const arena_ally = arena.allocator();
-    
+
     var set = try PasswordSet.init(arena_ally);
     defer set.deinit();
+
+    var fucker = FileFucker{};
+    defer fucker.deinit(ally);
 
     // get input file path from args
     const args = try std.process.argsAlloc(ally);
@@ -322,21 +363,13 @@ pub fn main() !void {
     const out_filepath = args[1];
     const in_filepaths = args[2..];
 
-    // file management
-    var dedup_prog = std.Progress{};
-    const dedup_node = dedup_prog.start("deduplicating files", in_filepaths.len);
-    defer dedup_node.end();
-
-    defer unloadFiles(ally);
-
+    // load files
     for (in_filepaths) |in_filepath| {
-        try loadFile(ally, in_filepath);
+        try fucker.add(ally, in_filepath);
     }
 
     // do the stuff
-    for (files.items, 0..) |file, i| {
-        try dedupFile(&set, dedup_node, in_filepaths[i], file);
-    }
+    try fucker.dedup(&set);
 
     // write to the output file
     try set.extrude(out_filepath);
