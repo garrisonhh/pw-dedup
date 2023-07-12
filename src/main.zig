@@ -70,6 +70,7 @@ fn addPassword(
 
 fn extrude(prog: *Progress.Node, path: []const u8) !void {
     var prog_node = prog.start("extruding", password_count);
+    prog_node.activate();
     defer prog_node.end();
 
     // buffered write to output
@@ -97,13 +98,23 @@ fn extrude(prog: *Progress.Node, path: []const u8) !void {
 const MappedFile = struct {
     const Self = @This();
 
+    const Block = struct {
+        /// required for munmap, not usable (contains garbage at the end)
+        memory: []align(std.mem.page_size) u8,
+        /// useful text
+        text: []const u8,
+    };
+
     const InitError = std.os.OpenError || std.os.MMapError || std.os.SeekError;
+    /// if you get an OOM error, it is likely that this is too large
+    const max_block_bytes = 1024 * std.mem.page_size;
 
     fd: std.os.fd_t,
-    text: []align(std.mem.page_size) const u8,
+    blocks: std.ArrayListUnmanaged(Block),
 
     /// open and mmap a file from a path
-    fn init(path: []const u8) InitError!Self {
+    /// TODO split this up for readability if I need to return to it
+    fn init(ally: Allocator, path: []const u8) InitError!Self {
         // open file for reading
         const fd = try std.os.open(path, std.os.linux.O.RDONLY, 0);
 
@@ -112,27 +123,104 @@ const MappedFile = struct {
         const byte_length = try std.os.lseek_CUR_get(fd);
         try std.os.lseek_SET(fd, 0);
 
-        // mmap
-        const text = try std.os.mmap(
-            null,
-            byte_length,
-            std.os.linux.PROT.READ,
-            std.os.linux.MAP.SHARED,
-            fd,
-            0,
-        );
+        // mmap blocks
+        const PROT = std.os.linux.PROT;
+        const MAP = std.os.linux.MAP;
+        
+        var blocks = std.ArrayListUnmanaged(Block){};
+
+        var offset: usize = 0; // offset of current block
+        var text_offset: usize = 0; // offset of text into the next block
+        while (offset < byte_length) {
+            // acq memory
+            const max_bytes = @min(byte_length - offset, max_block_bytes);
+            const memory = try std.os.mmap(
+                null,
+                max_bytes,
+                PROT.READ,
+                MAP.SHARED,
+                fd,
+                offset,
+            );
+
+            // trim to line boundary if there's another block after this one
+            var text: []const u8 = memory[text_offset..];
+            if (offset + memory.len < byte_length) {
+                // get memory window for text
+                var boundary = memory.len - 1;
+                while (boundary > 0 and memory[boundary] != '\n') {
+                    boundary -= 1;
+                }
+
+                text = memory[text_offset..boundary];
+
+                // find next offset and text offset
+                const aligned_offset =
+                    @divFloor(boundary, std.mem.page_size) *
+                    std.mem.page_size;
+
+                offset += aligned_offset;
+                text_offset = boundary - aligned_offset;
+            } else {
+                // we're done
+                offset = byte_length;
+            }
+            
+            std.debug.print("loaded block: {} -> {}\n", .{offset - memory.len, memory.len});
+
+            try blocks.append(ally, Block{
+                .memory = memory,
+                .text = text,
+            });
+        }
 
         return Self{
             .fd = fd,
-            .text = text,
+            .blocks = blocks,
         };
     }
 
     /// munmap and close the file
-    fn deinit(self: Self) void {
-        std.os.munmap(self.text);
+    fn deinit(self: *Self, ally: Allocator) void {
+        for (self.blocks.items) |block| std.os.munmap(block.memory);
+        self.blocks.deinit(ally);
         std.os.close(self.fd);
     }
+
+    /// iterate over passwords
+    fn iterator(self: Self) Iterator {
+        return .{ .blocks = self.blocks.items };
+    }
+
+    const Iterator = struct {
+        /// blocks remaining
+        blocks: []const Block,
+        /// current tokenizer
+        tokenizer: ?std.mem.TokenIterator(u8, .scalar) = null,
+
+        fn next(iter: *Iterator) ?[]const u8 {
+            // null case; get next block
+            if (iter.tokenizer == null) {
+                if (iter.blocks.len == 0) {
+                    return null;
+                }
+
+                const block = iter.blocks[0];
+                iter.blocks = iter.blocks[1..];
+
+                iter.tokenizer = std.mem.tokenizeScalar(u8, block.text, '\n');
+            }
+
+            // get a token
+            if (iter.tokenizer.?.next()) |token| {
+                return token;
+            }
+
+            // no tokens remaining, recurse to try the next block
+            iter.tokenizer = null;
+            return iter.next();
+        }
+    };
 };
 
 var files: std.ArrayListUnmanaged(MappedFile) = .{};
@@ -141,31 +229,47 @@ fn loadFile(
     ally: Allocator,
     path: []const u8,
 )(Allocator.Error || MappedFile.InitError)!void {
-    const file = try MappedFile.init(path);
+    const file = try MappedFile.init(ally, path);
     try files.append(ally, file);
 }
 
 fn unloadFiles(ally: Allocator) void {
-    for (files.items) |file| file.deinit();
+    for (files.items) |*file| file.deinit(ally);
     files.deinit(ally);
 }
 
 fn dedupFile(
     bump_ally: Allocator, // bump allocator for chains
     prog: *Progress.Node,
+    file_display_name: []const u8,
     file: MappedFile,
 ) !void {
     // progress
-    const est_passwords = std.mem.count(u8, file.text, "\n");
+    var est_passwords: usize = 0;
 
-    var node = prog.start("deduping password occurrences", est_passwords);
-    defer node.end();
+    {
+        var iter = file.iterator();
+        while (iter.next()) |_| est_passwords += 1;
+    }
+    
+    var buf: [512]u8 = undefined;
+    const desc = try std.fmt.bufPrint(
+        &buf,
+        "processing {s}",
+        .{file_display_name},
+    );
 
+    var prog_node = prog.start(desc, est_passwords);
+    prog_node.activate();
+    defer prog_node.end();
+    
     // do work
-    var tokenizer = std.mem.tokenizeScalar(u8, file.text, '\n');
-    while (tokenizer.next()) |pw| {
-        try addPassword(bump_ally, pw);
-        node.completeOne();
+    {
+        var iter = file.iterator();
+        while (iter.next()) |password| {
+            try addPassword(bump_ally, password);
+            prog_node.completeOne();
+        }
     }
 }
 
@@ -215,17 +319,7 @@ pub fn main() !void {
 
     // do the stuff
     for (files.items, 0..) |file, i| {
-        var buf: [512]u8 = undefined;
-        const desc = try std.fmt.bufPrint(
-            &buf,
-            "processing {s}",
-            .{in_filepaths[i]},
-        );
-
-        var prog_node = prog_root.start(desc, 0);
-        defer prog_node.end();
-
-        try dedupFile(arena_ally, &prog_node, file);
+        try dedupFile(arena_ally, prog_root, in_filepaths[i], file);
     }
 
     try extrude(prog_root, out_filepath);
