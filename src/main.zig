@@ -142,8 +142,6 @@ const MappedFile = struct {
                 fd,
                 offset,
             );
-            
-            std.debug.print("loaded block: {} -> ", .{offset});
 
             // trim to line boundary if there's another block after this one
             var text: []const u8 = memory[text_offset..];
@@ -167,8 +165,6 @@ const MappedFile = struct {
                 // we're done
                 offset = byte_length;
             }
-
-            std.debug.print("{}\n", .{offset});
 
             try blocks.append(ally, Block{
                 .memory = memory,
