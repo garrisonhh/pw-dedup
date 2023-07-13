@@ -14,15 +14,13 @@ var gpa_lock: std.Thread.Mutex = .{};
 
 // map mechanism ===============================================================
 
-const Hash = struct {
+const Hash = packed struct(u32) {
     const Self = @This();
 
-    const seed = 0xBEEF_FA7; // lol
-
-    n: u64,
+    n: u32,
 
     fn init(str: []const u8) Self {
-        const n = std.hash.Wyhash.hash(seed, str);
+        const n = std.hash.Crc32.hash(str);
         return .{ .n = n };
     }
 
@@ -32,8 +30,17 @@ const Hash = struct {
 };
 
 const Password = struct {
+    const Self = @This();
+    
+    const LengthInt = u32;
+
     hash: Hash,
-    str: []const u8,
+    len: LengthInt,
+    ptr: [*]const u8,
+
+    fn str(self: Self) []const u8 {
+        return self.ptr[0..self.len];
+    }
 };
 
 const PasswordSet = struct {
@@ -76,7 +83,7 @@ const PasswordSet = struct {
         defer chain.mutex.unlock();
 
         for (chain.list.items) |pw| {
-            if (pw.hash.eql(hash) and std.mem.eql(u8, pw.str, str)) {
+            if (pw.hash.eql(hash) and std.mem.eql(u8, pw.str(), str)) {
                 // found match!
                 break;
             }
@@ -86,10 +93,11 @@ const PasswordSet = struct {
 
             gpa_lock.lock();
             defer gpa_lock.unlock();
-            
+
             try chain.list.append(self.ally, Password{
                 .hash = hash,
-                .str = str,
+                .ptr = str.ptr,
+                .len = @intCast(Password.LengthInt, str.len),
             });
         }
     }
@@ -109,7 +117,7 @@ const PasswordSet = struct {
         // iterate over counter and write
         for (self.chains) |chain| {
             for (chain.list.items) |pw| {
-                try strm.print("{s}\n", .{ pw.str });
+                try strm.print("{s}\n", .{ pw.str() });
                 prog_node.completeOne();
             }
         }
@@ -130,7 +138,11 @@ const MappedFile = struct {
         text: []const u8,
     };
 
-    const InitError = std.os.OpenError || std.os.MMapError || std.os.SeekError;
+    const InitError =
+        std.os.OpenError ||
+        std.os.MMapError ||
+        std.os.SeekError ||
+        error { LongLineInInput };
 
     /// if you get an OOM error, it is likely that this is too large.
     ///
@@ -177,14 +189,10 @@ const MappedFile = struct {
             if (offset + memory.len < byte_length) {
                 // get memory window for text (ends at final newline) 
                 var boundary = memory.len - 1;
-                
-                std.debug.print("starting at {}\n", .{boundary});
 
                 while (boundary > text_offset and memory[boundary] != '\n') {
                     boundary -= 1;
                 }
-
-                std.debug.print("stopping at {}\n", .{boundary});
 
                 text = memory[text_offset..boundary];
 
@@ -192,7 +200,11 @@ const MappedFile = struct {
                 const aligned_offset =
                     @divFloor(boundary, std.mem.page_size) *
                     std.mem.page_size;
-                
+
+                if (aligned_offset == 0) {
+                    return InitError.LongLineInInput;
+                }
+
                 offset += aligned_offset;
                 text_offset = boundary - aligned_offset;
             } else {
