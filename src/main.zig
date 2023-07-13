@@ -131,8 +131,12 @@ const MappedFile = struct {
     };
 
     const InitError = std.os.OpenError || std.os.MMapError || std.os.SeekError;
-    /// if you get an OOM error, it is likely that this is too large
-    const max_block_bytes = 1024 * std.mem.page_size;
+
+    /// if you get an OOM error, it is likely that this is too large.
+    ///
+    /// however, this *must* be more than one page_size for iteration to work
+    /// when creating blocks
+    const max_block_bytes = 4096 * std.mem.page_size;
 
     fd: std.os.fd_t,
     blocks: std.ArrayListUnmanaged(Block),
@@ -171,11 +175,16 @@ const MappedFile = struct {
             // trim to line boundary if there's another block after this one
             var text: []const u8 = memory[text_offset..];
             if (offset + memory.len < byte_length) {
-                // get memory window for text
+                // get memory window for text (ends at final newline) 
                 var boundary = memory.len - 1;
-                while (boundary > 0 and memory[boundary] != '\n') {
+                
+                std.debug.print("starting at {}\n", .{boundary});
+
+                while (boundary > text_offset and memory[boundary] != '\n') {
                     boundary -= 1;
                 }
+
+                std.debug.print("stopping at {}\n", .{boundary});
 
                 text = memory[text_offset..boundary];
 
@@ -183,7 +192,7 @@ const MappedFile = struct {
                 const aligned_offset =
                     @divFloor(boundary, std.mem.page_size) *
                     std.mem.page_size;
-
+                
                 offset += aligned_offset;
                 text_offset = boundary - aligned_offset;
             } else {
