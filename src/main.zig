@@ -4,6 +4,7 @@ const stderr = std.io.getStdErr().writer();
 const Allocator = std.mem.Allocator;
 const Progress = std.Progress;
 const BlockStream = @import("blockstream.zig");
+const timer = @import("timer.zig");
 
 // gpa =========================================================================
 
@@ -145,6 +146,8 @@ fn dedupEntry(set: *PasswordSet, iter: *BlockStream.Iterator) !void {
 
 /// threaded dedup with all the files
 fn dedup(set: *PasswordSet, paths: []const []const u8) !void {
+    const start_time = timer.now();
+
     const size_hint = 512 * std.mem.page_size; // TODO make this configurable?
     var iter = BlockStream.iterator(paths, size_hint);
 
@@ -159,6 +162,9 @@ fn dedup(set: *PasswordSet, paths: []const []const u8) !void {
     for (threads.slice()) |thread| {
         thread.join();
     }
+    
+    const duration = timer.now() - start_time;
+    try stderr.print("finished dedup in {d:.6}s.\n", .{duration});
 }
 
 // progress ====================================================================
