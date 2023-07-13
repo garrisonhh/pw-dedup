@@ -290,7 +290,8 @@ const FileFucker = struct {
 
     /// threaded dedup with all the files
     fn dedup(self: *const Self, set: *PasswordSet) !void {
-        var b = self.blockerator();
+        var progress = std.Progress{};
+        var b = self.blockerator(&progress);
 
         const cpu_count = try std.Thread.getCpuCount();    
         var threads = std.BoundedArray(std.Thread, 256){};
@@ -305,14 +306,31 @@ const FileFucker = struct {
         }
     }
 
-    fn blockerator(self: *const Self) Blockerator {
-        return .{ .files = self.files.items };
+    fn blockerator(self: *const Self, progress: *Progress) Blockerator {
+        var b = Blockerator{
+            .files = self.files.items,
+            .prog_node = undefined,
+        };
+
+        // count blocks
+        var total_blocks: usize = 0;
+        for (b.files) |file| {
+            total_blocks += file.blocks.items.len;
+        }
+
+        // start progress
+        b.prog_node = progress.start("processing blocks", total_blocks);
+
+        return b;
     }
 
     /// thread-safe block queue
     const Blockerator = struct {
-        files: []const MappedFile,
         mutex: std.Thread.Mutex = .{},
+        
+        prog_node: *Progress.Node,
+        
+        files: []const MappedFile,
         file: usize = 0,
         block: usize = 0,
         done: bool = false,
@@ -327,6 +345,8 @@ const FileFucker = struct {
             const blocks = b.files[b.file].blocks.items;
             const block = blocks[b.block];
 
+            b.prog_node.completeOne();
+
             // iterate
             b.block += 1;
             if (b.block >= blocks.len) {
@@ -335,6 +355,7 @@ const FileFucker = struct {
 
                 if (b.file >= b.files.len) {
                     b.done = true;
+                    b.prog_node.end();
                 }
             }
 
