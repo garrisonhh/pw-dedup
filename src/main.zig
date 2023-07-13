@@ -4,6 +4,14 @@ const stderr = std.io.getStdErr().writer();
 const Allocator = std.mem.Allocator;
 const Progress = std.Progress;
 
+// gpa =========================================================================
+
+var gpa = std.heap.GeneralPurposeAllocator(.{
+    .stack_trace_frames = 8,
+}){};
+/// required during threaded allocations
+var gpa_lock: std.Thread.Mutex = .{};
+
 // map mechanism ===============================================================
 
 const Hash = struct {
@@ -76,6 +84,9 @@ const PasswordSet = struct {
             // no match, add a link
             self.count += 1;
 
+            gpa_lock.lock();
+            defer gpa_lock.unlock();
+            
             try chain.list.append(self.ally, Password{
                 .hash = hash,
                 .str = str,
@@ -326,7 +337,6 @@ const FileFucker = struct {
 // progress ====================================================================
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const ally = gpa.allocator();
     defer _ = gpa.deinit();
 
