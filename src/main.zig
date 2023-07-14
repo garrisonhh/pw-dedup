@@ -96,6 +96,8 @@ const PasswordSet = struct {
             // no match, add a link
             self.count += 1;
 
+            // TODO this lock only needs to happen when capacity must be raised.
+            // this is probably bounding some performance
             gpa_lock.lock();
             defer gpa_lock.unlock();
 
@@ -144,6 +146,13 @@ fn dedupEntry(set: *PasswordSet, iter: *BlockStream.Iterator) !void {
     }
 }
 
+fn dedupEntryWrapped(set: *PasswordSet, iter: *BlockStream.Iterator) void {
+    dedupEntry(set, iter) catch |e| {
+        std.debug.print("ERR: {}\n", .{e});
+        std.debug.dumpCurrentStackTrace(null);
+    };
+}
+
 /// threaded dedup with all the files
 fn dedup(set: *PasswordSet, paths: []const []const u8) !void {
     const start_time = timer.now();
@@ -155,7 +164,11 @@ fn dedup(set: *PasswordSet, paths: []const []const u8) !void {
     var threads = std.BoundedArray(std.Thread, 256){};
 
     for (0..cpu_count) |_| {
-        const thread = try std.Thread.spawn(.{}, dedupEntry, .{ set, &iter });
+        const thread = try std.Thread.spawn(
+            .{},
+            dedupEntryWrapped,
+            .{ set, &iter },
+        );
         try threads.append(thread);
     }
 

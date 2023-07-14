@@ -192,7 +192,7 @@ pub const Iterator = struct {
 
     paths_remaining: []const []const u8,
     size_hint: usize,
-
+    
     /// state
     gpa: std.heap.GeneralPurposeAllocator(.{}) = .{},
     gpa_killed: bool = false,
@@ -242,8 +242,9 @@ pub const Iterator = struct {
         iter.bs = bs;
         iter.paths_remaining = iter.paths_remaining[1..];
         iter.ranges = try bs.scan(ally, iter.size_hint);
-        iter.index = 1;
+        iter.index = 0;
 
+        defer iter.index += 1;
         return iter.ranges[iter.index];
     }
 
