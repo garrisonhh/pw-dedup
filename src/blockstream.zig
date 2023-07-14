@@ -55,8 +55,15 @@ pub const Block = struct {
     text: []const u8,
 
     fn map(bs: Self, range: BlockRange) os.MMapError!Block {
-        const mem = try bs.map(range.aligned_offset, range.aligned_length);
-        const text = mem[range.offset - range.aligned_offset..range.length];
+        const aln_offset = std.mem.alignBackward(
+            usize,
+            range.offset,
+            page_size,
+        );
+        const aln_diff = range.offset - aln_offset;
+
+        const mem = try bs.map(aln_offset, aln_diff + range.length);
+        const text = mem[aln_diff..];
 
         return .{
             .mem = mem,
@@ -65,43 +72,13 @@ pub const Block = struct {
     }
 
     fn unmap(blk: Block) void {
-        // TODO pretty sure this is thread-safe but not entirely
         os.munmap(blk.mem);
     }
 };
 
 const BlockRange = struct {
-    /// actual offset
     offset: usize,
-    /// actual length
     length: usize,
-    /// offset for mmap
-    aligned_offset: usize,
-    /// length for mmap
-    aligned_length: usize,
-
-    fn init(offset: usize, length: usize) BlockRange {
-        const offset_diff = offset % page_size;
-        const aligned_offset = offset - offset_diff;
-
-        const ext_length = length + offset_diff;
-        const length_diff = ext_length % page_size;
-        const aligned_length =
-            ext_length - length_diff +
-            @as(usize, if (length_diff > 0) page_size else 0);
-
-        std.debug.assert(aligned_offset <= offset);
-        std.debug.assert(aligned_offset + aligned_length >= offset + length);
-        std.debug.assert(aligned_offset % page_size == 0);
-        std.debug.assert(aligned_length % page_size == 0);
-
-        return .{
-            .offset = offset,
-            .length = length,
-            .aligned_offset = aligned_offset,
-            .aligned_length = aligned_length,
-        };
-    }
 };
 
 const ScanError =
@@ -152,8 +129,10 @@ fn scan(
                     range_len = length;
                 }
 
-                const range = BlockRange.init(range_start, range_len);
-                try ranges.append(ally, range);
+                try ranges.append(ally, .{
+                    .offset = range_start,
+                    .length = range_len,
+                });
 
                 range_start += range_len;
                 range_len = 0;
@@ -162,10 +141,10 @@ fn scan(
 
         // for the final range, just generate a range (if it exists)
         if (is_eof and range_start < self.length) {
-            const range = BlockRange.init(
-                range_start,
-                self.length - range_start,
-            );
+            const range = BlockRange{
+                .offset = range_start,
+                .length = self.length - range_start,
+            };
 
             try ranges.append(ally, range);
         }
@@ -248,7 +227,7 @@ pub const Iterator = struct {
         return iter.ranges[iter.index];
     }
 
-    /// remember to unmap block when you're done with it
+    /// blocks are owned, remember to unmap if you're being a good citizen
     pub fn next(iter: *Iterator) Error!?Block {
         iter.mutex.lock();
         defer iter.mutex.unlock();
