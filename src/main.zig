@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const Progress = std.Progress;
 const BlockStream = @import("blockstream.zig");
 const timer = @import("timer.zig");
+const Store = @import("store.zig");
 
 // gpa =========================================================================
 
@@ -34,20 +35,14 @@ const Hash = packed struct(u32) {
 const Password = struct {
     const Self = @This();
 
-    const LengthInt = u32;
-
     hash: Hash,
-    len: LengthInt,
-    ptr: [*]const u8,
-
-    fn str(self: Self) []const u8 {
-        return self.ptr[0..self.len];
-    }
+    handle: Store.Handle,
 };
 
 const PasswordSet = struct {
     const Self = @This();
     const start_size = 1024 * 1024;
+    const temp_dir = "./.pw-dedup-temp/";
 
     const Chain = struct {
         mutex: std.Thread.Mutex = .{},
@@ -55,12 +50,14 @@ const PasswordSet = struct {
     };
 
     ally: Allocator,
+    store: Store,
     chains: []Chain,
     count: usize = 0,
 
-    fn init(ally: Allocator) Allocator.Error!Self {
+    fn init(ally: Allocator) !Self {
         var self = Self{
             .ally = ally,
+            .store = try Store.init(temp_dir),
             .chains = try ally.alloc(Chain, start_size),
         };
 
@@ -74,9 +71,10 @@ const PasswordSet = struct {
             chain.list.deinit(self.ally);
         }
         self.ally.free(self.chains);
+        self.store.deinit(self.ally);
     }
 
-    fn add(self: *Self, str: []const u8) Allocator.Error!void {
+    fn add(self: *Self, str: []const u8) Store.Error!void {
         const hash = Hash.init(str);
         const chain = &self.chains[hash.n % self.chains.len];
 
@@ -86,7 +84,9 @@ const PasswordSet = struct {
 
         for (chain.list.items(.hash), 0..) |other_hash, i| {
             if (other_hash.eql(hash)) {
-                const other_str = chain.list.get(i).str();
+                const handle = chain.list.items(.handle)[i];
+                const other_str = self.store.get(handle);
+
                 if (std.mem.eql(u8, str, other_str)) {
                     // found match!
                     break;
@@ -96,24 +96,19 @@ const PasswordSet = struct {
             // no match, add a link
             self.count += 1;
 
-            // TODO this lock only needs to happen when capacity must be raised.
-            // this is probably bounding some performance
             gpa_lock.lock();
             defer gpa_lock.unlock();
 
+            const handle = try self.store.store(self.ally, str);
+
             try chain.list.append(self.ally, Password{
                 .hash = hash,
-                .ptr = str.ptr,
-                .len = @intCast(Password.LengthInt, str.len),
+                .handle = handle,
             });
         }
     }
 
     fn extrude(self: Self, path: []const u8) !void {
-        var prog = std.Progress{};
-        var prog_node = prog.start("extruding", self.count);
-        defer prog_node.end();
-
         // buffered write to output
         const out_file = try std.fs.cwd().createFile(path, .{});
         defer out_file.close();
@@ -121,14 +116,7 @@ const PasswordSet = struct {
         var buf_writer = std.io.bufferedWriter(out_file.writer());
         const strm = buf_writer.writer();
 
-        // iterate over counter and write
-        for (self.chains) |chain| {
-            for (chain.list.items(.ptr), chain.list.items(.len)) |ptr, len| {
-                const str = ptr[0..len];
-                try strm.print("{s}\n", .{str});
-                prog_node.completeOne();
-            }
-        }
+        try self.store.dump(strm);
 
         try buf_writer.flush();
     }
@@ -138,9 +126,10 @@ const PasswordSet = struct {
 
 fn dedupEntry(set: *PasswordSet, iter: *BlockStream.Iterator) !void {
     while (try iter.next()) |block| {
+        defer block.unmap();
+
         var passwords = std.mem.tokenizeScalar(u8, block.text, '\n');
         while (passwords.next()) |password| {
-            if (password.len == 0) continue;
             try set.add(password);
         }
     }
@@ -148,8 +137,7 @@ fn dedupEntry(set: *PasswordSet, iter: *BlockStream.Iterator) !void {
 
 fn dedupEntryWrapped(set: *PasswordSet, iter: *BlockStream.Iterator) void {
     dedupEntry(set, iter) catch |e| {
-        std.debug.print("ERR: {}\n", .{e});
-        std.debug.dumpCurrentStackTrace(null);
+        std.debug.panic("error in thread: {}\n", .{e});
     };
 }
 
@@ -160,22 +148,28 @@ fn dedup(set: *PasswordSet, paths: []const []const u8) !void {
     const size_hint = 512 * std.mem.page_size; // TODO make this configurable?
     var iter = BlockStream.iterator(paths, size_hint);
 
-    const cpu_count = try std.Thread.getCpuCount();
-    var threads = std.BoundedArray(std.Thread, 256){};
+    // TODO remove testing artifact
+    const threaded = true;
+    if (threaded) {
+        const cpu_count = try std.Thread.getCpuCount();
+        var threads = std.BoundedArray(std.Thread, 256){};
 
-    for (0..cpu_count) |_| {
-        const thread = try std.Thread.spawn(
-            .{},
-            dedupEntryWrapped,
-            .{ set, &iter },
-        );
-        try threads.append(thread);
+        for (0..cpu_count) |_| {
+            const thread = try std.Thread.spawn(
+                .{},
+                dedupEntryWrapped,
+                .{ set, &iter },
+            );
+            try threads.append(thread);
+        }
+
+        for (threads.slice()) |thread| {
+            thread.join();
+        }
+    } else {
+        try dedupEntry(set, &iter);
     }
 
-    for (threads.slice()) |thread| {
-        thread.join();
-    }
-    
     const duration = timer.now() - start_time;
     try stderr.print("finished dedup in {d:.6}s.\n", .{duration});
 }
@@ -186,20 +180,13 @@ pub fn main() !void {
     const ally = gpa.allocator();
     defer _ = gpa.deinit();
 
-    var arena = std.heap.ArenaAllocator.init(ally);
-    defer arena.deinit();
-    const arena_ally = arena.allocator();
-
-    var set = try PasswordSet.init(arena_ally);
-    defer set.deinit();
-
     // get input file path from args
     const args = try std.process.argsAlloc(ally);
     defer std.process.argsFree(ally, args);
 
     if (args.len < 3) {
         try stderr.print(
-            \\usage: {[exe_name]s} [out.csv] [a.txt] [b.txt] [...] [z.txt]
+            \\usage: {[exe_name]s} [out.txt] [a.txt] [b.txt] [...] [z.txt]
             \\    provide an output filepath, and this will dedup the passwords
             \\    on each line of each input file.
             \\
@@ -217,8 +204,10 @@ pub fn main() !void {
     const in_filepaths = args[2..];
 
     // do the stuff
+    var set = try PasswordSet.init(ally);
+    defer set.deinit();
+
     try dedup(&set, in_filepaths);
 
-    // write to the output file
     try set.extrude(out_filepath);
 }

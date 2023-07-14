@@ -18,10 +18,7 @@
       zigpkgs = zig.packages.${system};
 
       inherit (pkgs.stdenv) mkDerivation;
-      inputs = [
-        zigpkgs."master-2023-06-21"
-        pkgs.libxcrypt # for patching zig compiler tsan support
-      ];
+      inputs = [ zigpkgs."master-2023-06-21" ];
 
       # create a derivation for the build with some args for `zig build`
       makePackage = buildArgs:
@@ -29,8 +26,6 @@
           args =
             with pkgs.lib.strings;
             concatStrings (intersperse " " buildArgs);
-
-          cryptInclude = "${pkgs.libxcrypt}/include/";
         in
           mkDerivation {
             name = name;
@@ -39,13 +34,10 @@
             nativeBuildInputs = inputs;
             buildPhase = ''
               export HOME=$NIX_BUILD_TOP
-              zig build --search-prefix ${cryptInclude} ${args}
+              zig build ${args}
             '';
 
             installPhase = ''
-              >&2 ls ./
-              >&2 ls ./zig-out/
-
               mkdir -p $out/bin/
               mkdir -p $bin/
               install zig-out/bin/${name} $bin/
@@ -61,7 +53,7 @@
       packages = {
         default = makePackage [];
         release = makePackage ["release"];
-        debug = makePackage ["release"];
+        debug = makePackage ["debug"];
       };
 
       # app config for 'nix run'

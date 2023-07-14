@@ -17,7 +17,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .Debug,
     });
-    exe_debug.sanitize_thread = true;
 
     b.installArtifact(exe_release);
     const build_release = b.addInstallArtifact(exe_release);
